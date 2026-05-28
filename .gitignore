@@ -1,0 +1,36 @@
+# Environment / credentials
+.env
+.env.*
+secrets.h
+credentials.h
+*_secret.*
+*_key.*
+*.key
+*.pem
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Arduino IDE
+*.bak
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Node (if any tooling)
+node_modules/
+npm-debug.log*
