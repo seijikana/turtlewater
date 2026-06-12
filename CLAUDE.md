@@ -137,7 +137,18 @@ Phase 2: そのまま T_FILL_EXTRA 秒追加給水
 | POST | `/api/m/{v1\|v2\|pump}/{0\|1}` | 手動バルブ・ポンプ操作 |
 
 WebUI は `http://turtle.local`（mDNS）または IP アドレスでアクセス。
-外出先からは Tailscale 経由（サブネットルーティング 192.168.0.0/24）で接続可能。
+
+### 外出先からのアクセス（Tailscale）
+- デスクトップPC（desktop-a2ii0o2）がサブネットルーターとして動作
+- 広告サブネット: `192.168.1.0/24`
+- ESP32 ローカルIP: `192.168.1.5`
+- 設定コマンド（PC側管理者PowerShell）:
+  ```powershell
+  tailscale up --advertise-routes=192.168.1.0/24 --accept-routes
+  ```
+- 管理画面でルート承認: https://login.tailscale.com/admin/machines
+- iPhone 側: Tailscale アプリ → desktop-a2ii0o2 →「Use Subnets」ON
+- アクセスURL: `http://192.168.1.5/`
 
 ---
 

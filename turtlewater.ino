@@ -331,7 +331,7 @@ bool run_auto() {
     if (!drain_tracking(T_TRANSFER_MAX)) return false;
     if (check_stop()) return false;
 
-    // Step 3: V1 ON → AL&BL ON 後 T_FILL_EXTRA 秒給水 (安全停止: AH or BH)
+    // Step 3: V1 ON → AH or BH ON で停止
     set_progress(3, TOTAL);
     Serial.println("[Auto] Step 3/4 fill");
     if (!fill_core()) { all_off(); return false; }
@@ -363,38 +363,21 @@ bool run_drain() {
     return ok;
 }
 
-// ─── 共通給水ルーティン ───────────────────────────────────────────────────────
-// Phase 1: V1 ON → AL & BL 両方 ON になるまで給水
-// Phase 2: そのまま T_FILL_EXTRA 秒追加給水
-// 安全停止: AH or BH 検知で即停止（上限に達したら水が十分なので正常完了扱い）
-// 戻り値: true=正常完了, false=タイムアウト or stop_flag
+// ─── 共通給水ルーティン (run_auto Step3 / run_fill 手動) ─────────────────────
+// AH or BH ON になるまで給水して停止
 static bool fill_core() {
     set_v1(true);
-    uint32_t deadline       = millis() + T_FILL_MAX * 1000UL;
-    bool     target_reached = false;
-    uint32_t target_since   = 0;
+    uint32_t deadline = millis() + T_FILL_MAX * 1000UL;
 
-    Serial.printf("[Fill] start  AH=%d BH=%d AL=%d BL=%d  extra=%lus\n",
+    Serial.printf("[Fill] start  AH=%d BH=%d AL=%d BL=%d\n",
         water_detected(PIN_AH), water_detected(PIN_BH),
-        water_detected(PIN_AL), water_detected(PIN_BL),
-        (unsigned long)T_FILL_EXTRA);
+        water_detected(PIN_AL), water_detected(PIN_BL));
 
     while (true) {
         sensors_update();
-        if (g_stop_flag)                                       { set_v1(false); return false; }
-        if (millis() > deadline)                               { set_v1(false); return false; }
-        if (water_detected(PIN_AH) || water_detected(PIN_BH)) { set_v1(false); return true;  } // 上限安全停止
-
-        // Phase 1→2: AL & BL 両方ON で追加給水タイマー開始
-        if (!target_reached && water_detected(PIN_AL) && water_detected(PIN_BL)) {
-            target_reached = true;
-            target_since   = millis();
-            Serial.printf("[Fill] AL&BL ON → extra fill %lus\n", (unsigned long)T_FILL_EXTRA);
-        }
-
-        // Phase 2: 追加給水時間が経過したら完了
-        if (target_reached && millis() - target_since >= T_FILL_EXTRA * 1000UL) break;
-
+        if (g_stop_flag)                                        { set_v1(false); return false; }
+        if (millis() > deadline)                                { set_v1(false); return false; }
+        if (water_detected(PIN_AH) || water_detected(PIN_BH))  { break; }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     set_v1(false);
@@ -404,11 +387,43 @@ static bool fill_core() {
     return true;
 }
 
+// watchdog 低水位補給: run_auto/run_fill とは別ロジック
+//   Phase 1: V1 ON → AL & BL 両方 ON になるまで給水
+//   Phase 2: そのまま T_FILL_EXTRA 秒追加給水
+//   安全停止: AH or BH 検知で即停止
 bool run_fill_low() {
     g_step = 1; g_progress = 10;
-    bool ok = fill_core();
+    set_v1(true);
+    uint32_t deadline       = millis() + T_FILL_MAX * 1000UL;
+    bool     target_reached = false;
+    uint32_t target_since   = 0;
+
+    Serial.printf("[FillLow] start  AH=%d BH=%d AL=%d BL=%d\n",
+        water_detected(PIN_AH), water_detected(PIN_BH),
+        water_detected(PIN_AL), water_detected(PIN_BL));
+
+    while (true) {
+        sensors_update();
+        if (g_stop_flag)                                       { set_v1(false); return false; }
+        if (millis() > deadline)                               { set_v1(false); return false; }
+        if (water_detected(PIN_AH) || water_detected(PIN_BH)) { set_v1(false); return true;  } // 上限安全停止
+
+        if (!target_reached && water_detected(PIN_AL) && water_detected(PIN_BL)) {
+            target_reached = true;
+            target_since   = millis();
+            Serial.printf("[FillLow] AL&BL ON → extra fill %lus\n", (unsigned long)T_FILL_EXTRA);
+        }
+
+        if (target_reached && millis() - target_since >= T_FILL_EXTRA * 1000UL) break;
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    set_v1(false);
+    Serial.printf("[FillLow] done  AH=%d BH=%d AL=%d BL=%d\n",
+        water_detected(PIN_AH), water_detected(PIN_BH),
+        water_detected(PIN_AL), water_detected(PIN_BL));
     g_progress = 100;
-    return ok;
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
