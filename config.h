@@ -2,8 +2,9 @@
 #include <Arduino.h>
 
 // ── Relay output pins (OFF = HIGH, ON = LOW) ─────────────────────────────────
-#define PIN_V1          16    // 給水バルブ (I2S競合回避のためGPIO16)
-#define PIN_V2          17    // 上→下移送バルブ (同上)
+#define PIN_V1          16    // 給水バルブ（電磁弁、GPIO16）
+#define PIN_V2          17    // 移送バルブ（電動弁 三線式、リレーNO=開信号・NC=閉信号）
+#define PIN_V3           4    // V3給水バルブ（電磁弁、2匹目リクガメ用、GPIO4）
 #define RELAY_ON        LOW
 #define RELAY_OFF       HIGH
 
@@ -22,7 +23,7 @@
 #define PIN_BTN2        18    // ②強制給水H  (GPIO12はストラッピングピンのため変更)
 #define PIN_BTN3        22    // ③強制排水   (GPIO15はストラッピングピンのため変更)
 #define PIN_BTN4        13    // ④緊急停止 (最優先)
-#define PIN_BTN5        21    // ⑤再起動
+#define PIN_BTN5        21    // ⑤V3給水開始（旧:再起動）
 
 #define DEBOUNCE_MS     300
 
@@ -32,6 +33,7 @@
 #define DEFAULT_T_FILL_MAX     600
 #define DEFAULT_T_FILL_EXTRA    20  // 低水位補給: AL&BL ON確認後の追加給水時間(秒)
 #define DEFAULT_T_SENSOR_DB      2  // 水位センサーデバウンス時間(秒): この秒数継続後に状態確定
+#define DEFAULT_T_V3_FILL       60  // V3給水時間(秒): 2匹目リクガメ用、センサーなし時間指定給水
 
 // ── History ring buffer ───────────────────────────────────────────────────────
 #define HISTORY_MAX     20

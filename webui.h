@@ -57,6 +57,7 @@ th{color:#00d4ff}
   <div class="btn-row">
     <button class="b-auto" onclick="apiPost('/api/start')">▶ 自動</button>
     <button class="b-fill" onclick="apiPost('/api/fill')">💧 給水</button>
+    <button class="b-fill" onclick="apiPost('/api/fill_v3')">🐢 V3給水</button>
     <button class="b-drain" onclick="apiPost('/api/drain')">🚿 排水</button>
     <button class="b-stop" onclick="apiPost('/api/stop')">⛔ 緊急停止</button>
   </div>
@@ -69,6 +70,8 @@ th{color:#00d4ff}
     <button class="b-sm" onclick="manual('v1',0)">V1 OFF</button>
     <button class="b-sm" onclick="manual('v2',1)">V2 ON</button>
     <button class="b-sm" onclick="manual('v2',0)">V2 OFF</button>
+    <button class="b-sm" onclick="manual('v3',1)">V3 ON</button>
+    <button class="b-sm" onclick="manual('v3',0)">V3 OFF</button>
     <button class="b-sm" onclick="manual('pump',1)">Pump ON</button>
     <button class="b-sm" onclick="manual('pump',0)">Pump OFF</button>
   </div>
@@ -88,12 +91,20 @@ th{color:#00d4ff}
 </div>
 
 <div class="card">
+  <h2>V3スケジュール（2匹目給水）</h2>
+  <div id="sched-v3-wrap"></div>
+  <div class="msg" id="m-sched-v3"></div>
+  <button class="save-btn" onclick="saveSchedV3()">保存</button>
+</div>
+
+<div class="card">
   <h2>タイムアウト設定（秒）</h2>
   <label>排水最大時間<input type="number" id="t-drain" min="10" max="3600"></label>
   <label>移送最大時間<input type="number" id="t-transfer" min="10" max="3600"></label>
   <label>給水最大時間<input type="number" id="t-fill" min="10" max="3600"></label>
   <label>低水位補給 追加給水時間（AL&amp;BL ON後）<input type="number" id="t-extra" min="0" max="300"></label>
   <label>センサーデバウンス時間（秒）<input type="number" id="t-sdb" min="0" max="30"></label>
+  <label>V3給水時間（2匹目リクガメ用、秒）<input type="number" id="t-v3fill" min="5" max="600"></label>
   <div class="msg" id="m-timer"></div>
   <button class="save-btn" onclick="saveTimers()">保存</button>
 </div>
@@ -117,21 +128,32 @@ th{color:#00d4ff}
 
 <script>
 const DOW=['日','月','火','水','木','金','土'];
-let _sched=null;
+let _sched=null, _schedV3=null;
 
-function buildSchedUI(){
-  const w=document.getElementById('sched-wrap');
+function buildSchedUI(containerId,sched,prefix){
+  const w=document.getElementById(containerId);
   w.innerHTML='';
   for(let i=0;i<4;i++){
-    const s=_sched?_sched[i]:{enabled:false,dow:0,hour:8,minute:0};
-    const dow=DOW.map((d,j)=>`<label><input type="checkbox" class="sd${i}" data-j="${j}"${(s.dow>>j)&1?' checked':''}>${d}</label>`).join('');
+    const s=sched?sched[i]:{enabled:false,dow:0,hour:8,minute:0};
+    const dow=DOW.map((d,j)=>`<label><input type="checkbox" class="${prefix}sd${i}" data-j="${j}"${(s.dow>>j)&1?' checked':''}>${d}</label>`).join('');
     const hh=String(s.hour).padStart(2,'0'),mm=String(s.minute).padStart(2,'0');
     w.innerHTML+=`<div class="srow">
-      <input type="checkbox" id="se${i}"${s.enabled?' checked':''}> スロット${i+1}
+      <input type="checkbox" id="${prefix}se${i}"${s.enabled?' checked':''}> スロット${i+1}
       <div class="dow-wrap">${dow}</div>
-      <input type="time" id="st${i}" value="${hh}:${mm}" style="width:auto">
+      <input type="time" id="${prefix}st${i}" value="${hh}:${mm}" style="width:auto">
     </div>`;
   }
+}
+
+function readSchedUI(prefix){
+  const slots=[];
+  for(let i=0;i<4;i++){
+    let dow=0;
+    document.querySelectorAll(`.${prefix}sd${i}`).forEach(cb=>{if(cb.checked)dow|=(1<<+cb.dataset.j);});
+    const t=document.getElementById(`${prefix}st${i}`).value.split(':');
+    slots.push({enabled:document.getElementById(`${prefix}se${i}`).checked,dow,hour:+t[0],minute:+t[1]});
+  }
+  return slots;
 }
 
 async function poll(){
@@ -176,6 +198,7 @@ async function loadTimers(){
     document.getElementById('t-fill').value=d.fill_max;
     document.getElementById('t-extra').value=d.fill_extra;
     document.getElementById('t-sdb').value=d.sensor_db;
+    document.getElementById('t-v3fill').value=d.v3_fill;
   }catch(e){}
 }
 async function saveTimers(){
@@ -184,25 +207,31 @@ async function saveTimers(){
     transfer_max:+document.getElementById('t-transfer').value,
     fill_max:+document.getElementById('t-fill').value,
     fill_extra:+document.getElementById('t-extra').value,
-    sensor_db:+document.getElementById('t-sdb').value
+    sensor_db:+document.getElementById('t-sdb').value,
+    v3_fill:+document.getElementById('t-v3fill').value
   });
   const r=await fetch('/api/timers',{method:'POST',headers:{'Content-Type':'application/json'},body});
   document.getElementById('m-timer').textContent=r.ok?'✔ 保存しました':'✘ エラー';
 }
 
 async function loadSched(){
-  try{_sched=await(await fetch('/api/sched')).json();buildSchedUI();}catch(e){buildSchedUI();}
+  try{_sched=await(await fetch('/api/sched')).json();}catch(e){}
+  buildSchedUI('sched-wrap',_sched,'');
 }
 async function saveSched(){
-  const slots=[];
-  for(let i=0;i<4;i++){
-    let dow=0;
-    document.querySelectorAll(`.sd${i}`).forEach(cb=>{if(cb.checked)dow|=(1<<+cb.dataset.j);});
-    const t=document.getElementById(`st${i}`).value.split(':');
-    slots.push({enabled:document.getElementById(`se${i}`).checked,dow,hour:+t[0],minute:+t[1]});
-  }
+  const slots=readSchedUI('');
   const r=await fetch('/api/sched',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(slots)});
   document.getElementById('m-sched').textContent=r.ok?'✔ 保存しました':'✘ エラー';
+}
+
+async function loadSchedV3(){
+  try{_schedV3=await(await fetch('/api/sched_v3')).json();}catch(e){}
+  buildSchedUI('sched-v3-wrap',_schedV3,'v3');
+}
+async function saveSchedV3(){
+  const slots=readSchedUI('v3');
+  const r=await fetch('/api/sched_v3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(slots)});
+  document.getElementById('m-sched-v3').textContent=r.ok?'✔ 保存しました':'✘ エラー';
 }
 
 async function loadSB(){
@@ -230,7 +259,7 @@ async function saveWifi(){
   document.getElementById('m-wf').textContent=r.ok?'✔ 保存 → 再起動中…':'✘ エラー';
 }
 
-poll();loadTimers();loadSched();loadSB();
+poll();loadTimers();loadSched();loadSchedV3();loadSB();
 setInterval(poll,3000);
 </script>
 </body></html>)rawhtml";

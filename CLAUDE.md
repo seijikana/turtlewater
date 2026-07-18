@@ -21,8 +21,8 @@ ESP32-DevKitC を使った亀水槽の自動水替えシステム。Arduino IDE 
 
 | GPIO | 用途 |
 |---|---|
-| 16 | V1 給水バルブ（リレー、OFF=HIGH） |
-| 17 | V2 上→下移送バルブ（リレー、OFF=HIGH） |
+| 16 | V1 給水バルブ（電磁弁、リレー、OFF=HIGH） |
+| 17 | V2 移送バルブ（電動弁 三線式、リレーNO=開信号・NC=閉信号） |
 | 25 | 圧電ブザー+（LEDC/PWM）、−→GND |
 | 32 | AH センサー（上タライ 上限） |
 | 33 | AL センサー（上タライ 下限） |
@@ -37,6 +37,12 @@ ESP32-DevKitC を使った亀水槽の自動水替えシステム。Arduino IDE 
 ### 水位センサー（XKC-Y25-NPN）
 - INPUT_PULLUP
 - `water_detected = digitalRead(pin) == HIGH`（水あり → HIGH）
+
+### V2 電動ボールバルブ（U.S. Solid 三線式 9-24V）
+- リレー1個で制御。リレーNO → 開信号線、リレーNC → 閉信号線
+- リレーON（コイル励磁）→ NO閉 → 開信号通電 → バルブ開
+- リレーOFF（コイル非励磁）→ NC閉 → 閉信号通電 → バルブ閉
+- 内蔵リミットスイッチが全開/全閉で自動停止するため、常時通電・コード変更不要
 
 ### ドリルポンプ
 - SwitchBot プラグ経由で制御（HTTPS API）
@@ -139,16 +145,17 @@ Phase 2: そのまま T_FILL_EXTRA 秒追加給水
 WebUI は `http://turtle.local`（mDNS）または IP アドレスでアクセス。
 
 ### 外出先からのアクセス（Tailscale）
-- デスクトップPC（desktop-a2ii0o2）がサブネットルーターとして動作
+- raspizero2（rasberrypizero2whlite、IPカメラ兼用、`ipcamera/SETUP.md` 参照）がサブネットルーターとして動作（2026-07-14〜。旧デスクトップPC desktop-a2ii0o2 は電気代節約のため退役）
 - 広告サブネット: `192.168.1.0/24`
 - ESP32 ローカルIP: `192.168.1.5`
-- 設定コマンド（PC側管理者PowerShell）:
-  ```powershell
-  tailscale up --advertise-routes=192.168.1.0/24 --accept-routes
+- 設定コマンド（raspizero2側、SSH経由）:
+  ```bash
+  sudo tailscale up --advertise-routes=192.168.1.0/24 --accept-routes
   ```
 - 管理画面でルート承認: https://login.tailscale.com/admin/machines
-- iPhone 側: Tailscale アプリ → desktop-a2ii0o2 →「Use Subnets」ON
+- iPhone 側: Tailscale アプリ → rasberrypizero2whlite →「Use Subnets」ON
 - アクセスURL: `http://192.168.1.5/`
+- 動作確認済み（スマホ → raspizero2 → ESP32）
 
 ---
 

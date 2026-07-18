@@ -83,6 +83,7 @@ volatile uint32_t T_TRANSFER_MAX;
 volatile uint32_t T_FILL_MAX;
 volatile uint32_t T_FILL_EXTRA;   // 低水位補給: AL&BL ON確認後の追加給水時間
 volatile uint32_t T_SENSOR_DB;    // 水位センサーデバウンス時間(秒)
+volatile uint32_t T_V3_FILL;      // V3給水時間(秒): 2匹目リクガメ用、センサーなし時間指定給水
 
 // ─── 実行履歴リングバッファ ──────────────────────────────────────────────────
 struct HistEntry {
@@ -104,10 +105,11 @@ struct SchedSlot {
     uint8_t minute;
 };
 static SchedSlot g_sched[SCHED_SLOTS];
+static SchedSlot g_sched_v3[SCHED_SLOTS]; // V3専用スケジュール（V1/V2とは独立）
 
 // ─── シーケンスキュー ─────────────────────────────────────────────────────────
 struct SeqReq {
-    uint8_t type;          // 0=auto, 1=fill, 2=drain
+    uint8_t type;          // 0=auto, 1=fill, 2=drain, 3=fill_low(watchdog), 4=fill_v3
     char    trigger[12];
 };
 static QueueHandle_t g_seq_queue;
@@ -183,6 +185,7 @@ inline bool water_detected(int pin) {
 
 void set_v1(bool on) { digitalWrite(PIN_V1, on ? RELAY_ON : RELAY_OFF); }
 void set_v2(bool on) { digitalWrite(PIN_V2, on ? RELAY_ON : RELAY_OFF); }
+void set_v3(bool on) { digitalWrite(PIN_V3, on ? RELAY_ON : RELAY_OFF); }
 
 bool pump_on()  { return switchbot.pumpOn();  }
 bool pump_off() { return switchbot.pumpOff(); }
@@ -190,6 +193,7 @@ bool pump_off() { return switchbot.pumpOff(); }
 void all_off() {
     set_v1(false);
     set_v2(false);
+    set_v3(false);
     pump_off();
 }
 
@@ -426,6 +430,23 @@ bool run_fill_low() {
     return true;
 }
 
+// V3給水: センサーなし、設定時間のみで給水（2匹目リクガメ用）
+bool run_fill_v3() {
+    g_step = 1; g_progress = 10;
+    Serial.printf("[FillV3] start  duration=%lus\n", (unsigned long)T_V3_FILL);
+    set_v3(true);
+    uint32_t deadline = millis() + T_V3_FILL * 1000UL;
+    while (true) {
+        if (g_stop_flag)          { set_v3(false); return false; }
+        if (millis() >= deadline) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    set_v3(false);
+    g_progress = 100;
+    Serial.println("[FillV3] done");
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  FreeRTOS タスク
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -450,7 +471,9 @@ void seq_task(void* pv) {
             case 0: ok = run_auto();      break;
             case 1: ok = run_fill();      break;
             case 2: ok = run_drain();     break;
-            default:ok = run_fill_low();  break; // 3: watchdog低水位補給
+            case 3: ok = run_fill_low();  break; // watchdog低水位補給
+            case 4: ok = run_fill_v3();   break;
+            default:ok = false;           break;
         }
         all_off(); // 安全フォールバック
 
@@ -532,6 +555,22 @@ void watchdog_sched_task(void* pv) {
             xQueueSend(g_seq_queue, &req, 0);
             break; // 1分に1スロットのみ
         }
+
+        // ── V3スケジューラ: V1/V2とは独立、同じ1分間に別途1スロットまで発火 ────
+        for (int i = 0; i < SCHED_SLOTS; i++) {
+            SchedSlot& s = g_sched_v3[i];
+            if (!s.enabled)                          continue;
+            if (ti.tm_hour   != s.hour)              continue;
+            if (ti.tm_min    != s.minute)            continue;
+            if (!((s.dow_mask >> ti.tm_wday) & 1))  continue;
+
+            Serial.printf("[SchedV3] slot %d firing\n", i);
+            SeqReq req;
+            req.type = 4; // fill_v3
+            strncpy(req.trigger, "sched_v3", 11);
+            xQueueSend(g_seq_queue, &req, 0);
+            break;
+        }
     }
 }
 
@@ -586,12 +625,14 @@ void handle_status() {
 void handle_start()  { enqueue_from_web(0, "web"); }
 void handle_fill()   { enqueue_from_web(1, "web"); }
 void handle_drain()  { enqueue_from_web(2, "web"); }
+void handle_fill_v3(){ enqueue_from_web(4, "web_v3"); }
 
 void handle_stop() {
     Serial.println("[STOP] Web UI");
     g_stop_flag = true;
     set_v1(false);
     set_v2(false);
+    set_v3(false);
     pump_off();
     server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -610,7 +651,8 @@ void handle_get_timers() {
              + ",\"transfer_max\":" + String(T_TRANSFER_MAX)
              + ",\"fill_max\":"     + String(T_FILL_MAX)
              + ",\"fill_extra\":"   + String(T_FILL_EXTRA)
-             + ",\"sensor_db\":"    + String(T_SENSOR_DB) + "}";
+             + ",\"sensor_db\":"    + String(T_SENSOR_DB)
+             + ",\"v3_fill\":"      + String(T_V3_FILL) + "}";
     server.send(200, "application/json", j);
 }
 
@@ -624,6 +666,7 @@ void handle_post_timers() {
     int d   = getInt("drain_max"), tr = getInt("transfer_max");
     int f   = getInt("fill_max"),  fe = getInt("fill_extra");
     int sdb = getInt("sensor_db");
+    int v3f = getInt("v3_fill");
     Preferences prefs;
     prefs.begin("timers", false);
     if (d   > 0)  { T_DRAIN_MAX    = d;   prefs.putUInt("drain",      d);   }
@@ -631,6 +674,7 @@ void handle_post_timers() {
     if (f   > 0)  { T_FILL_MAX     = f;   prefs.putUInt("fill",       f);   }
     if (fe  > 0)  { T_FILL_EXTRA   = fe;  prefs.putUInt("fill_extra", fe);  }
     if (sdb >= 0) { T_SENSOR_DB    = sdb; prefs.putUInt("sensor_db",  sdb); }
+    if (v3f > 0)  { T_V3_FILL      = v3f; prefs.putUInt("v3_fill",    v3f); }
     prefs.end();
     server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -689,6 +733,63 @@ void handle_post_sched() {
         slot++;
     }
     sched_save_prefs();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handle_get_sched_v3() {
+    String j = "[";
+    for (int i = 0; i < SCHED_SLOTS; i++) {
+        if (i) j += ",";
+        j += "{\"enabled\":"  + String(g_sched_v3[i].enabled  ? "true":"false");
+        j += ",\"dow\":"      + String(g_sched_v3[i].dow_mask);
+        j += ",\"hour\":"     + String(g_sched_v3[i].hour);
+        j += ",\"minute\":"   + String(g_sched_v3[i].minute) + "}";
+    }
+    j += "]";
+    server.send(200, "application/json", j);
+}
+
+static void sched_v3_save_prefs() {
+    Preferences prefs;
+    prefs.begin("schedv3", false);
+    char key[8];
+    for (int i = 0; i < SCHED_SLOTS; i++) {
+        snprintf(key, sizeof(key), "en%d",  i); prefs.putBool (key, g_sched_v3[i].enabled);
+        snprintf(key, sizeof(key), "dow%d", i); prefs.putUChar(key, g_sched_v3[i].dow_mask);
+        snprintf(key, sizeof(key), "h%d",   i); prefs.putUChar(key, g_sched_v3[i].hour);
+        snprintf(key, sizeof(key), "m%d",   i); prefs.putUChar(key, g_sched_v3[i].minute);
+    }
+    prefs.end();
+}
+
+void handle_post_sched_v3() {
+    String body = server.arg("plain");
+    int slot = 0;
+    int pos  = 0;
+    while (slot < SCHED_SLOTS && pos < (int)body.length()) {
+        int ob = body.indexOf('{', pos);
+        int cb = body.indexOf('}', ob);
+        if (ob < 0 || cb < 0) break;
+        String obj = body.substring(ob, cb + 1);
+        auto getVal = [&](const char* key) -> int {
+            String k = String("\"") + key + "\":";
+            int p = obj.indexOf(k);
+            if (p < 0) return -1;
+            String v = obj.substring(p + k.length());
+            if (v.startsWith("true"))  return 1;
+            if (v.startsWith("false")) return 0;
+            return v.toInt();
+        };
+        int en = getVal("enabled"), dow = getVal("dow");
+        int h  = getVal("hour"),    m   = getVal("minute");
+        if (en  >= 0) g_sched_v3[slot].enabled  = (en == 1);
+        if (dow >= 0) g_sched_v3[slot].dow_mask = (uint8_t)dow;
+        if (h   >= 0) g_sched_v3[slot].hour     = (uint8_t)h;
+        if (m   >= 0) g_sched_v3[slot].minute   = (uint8_t)m;
+        pos = cb + 1;
+        slot++;
+    }
+    sched_v3_save_prefs();
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -769,6 +870,9 @@ static void handle_manual(const String& path) {
     } else if (dev == "v2") {
         set_v2(on);
         server.send(200, "application/json", "{\"ok\":true}");
+    } else if (dev == "v3") {
+        set_v3(on);
+        server.send(200, "application/json", "{\"ok\":true}");
     } else if (dev == "pump") {
         bool ok = on ? pump_on() : pump_off();
         server.send(ok ? 200 : 500, "application/json",
@@ -800,7 +904,7 @@ void IRAM_ATTR isr_btn4() {                 // 緊急停止: ISR はフラグの
         g_btn_flag[3] = true;              // ← g_stop_flag はここでセットしない
     }
 }
-void IRAM_ATTR isr_btn5() {                 // 再起動: ISR はフラグのみ (BTN4 と同方式)
+void IRAM_ATTR isr_btn5() {                 // V3給水開始: ISR はフラグのみ (BTN4 と同方式)
     uint32_t now = millis();
     if (now - g_btn_last[4] > DEBOUNCE_MS) {
         g_btn_last[4] = now;
@@ -849,23 +953,21 @@ static void process_buttons() {
         if (digitalRead(PIN_BTN4) == LOW) { // まだ LOW = 本物の押下
             Serial.println("[STOP] BTN4");
             g_stop_flag = true;
-            set_v1(false); set_v2(false); pump_off();
+            set_v1(false); set_v2(false); set_v3(false); pump_off();
         } else {
             Serial.println("[STOP] BTN4 noise (ignored)");
         }
     }
-    if (g_btn_flag[4]) {                    // ⑤再起動: ピン再読でノイズか本物か判定
+    if (g_btn_flag[4]) {                    // ⑤V3給水開始: ピン再読でノイズか本物か判定
         g_btn_flag[4] = false;
         vTaskDelay(pdMS_TO_TICKS(20));
-        if (digitalRead(PIN_BTN5) == LOW) { // まだ LOW = 本物の押下
-            Serial.println("[REBOOT] BTN5");
-            all_off();
-            Serial.flush();
-            delay(200);
-            esp_restart();
-        } else {
-            Serial.println("[REBOOT] BTN5 noise (ignored)");
-        }
+        if (digitalRead(PIN_BTN5) == LOW) {
+            if (!g_running && uxQueueMessagesWaiting(g_seq_queue) == 0) {
+                Serial.println("[BTN] BTN5 fill_v3");
+                SeqReq req; req.type = 4; strncpy(req.trigger, "fill_v3", 11);
+                xQueueSend(g_seq_queue, &req, 0);
+            }
+        } else { Serial.println("[BTN] BTN5 noise (ignored)"); }
     }
 }
 
@@ -926,6 +1028,7 @@ static void prefs_load() {
     T_FILL_MAX     = prefs.getUInt("fill",       DEFAULT_T_FILL_MAX);
     T_FILL_EXTRA   = prefs.getUInt("fill_extra", DEFAULT_T_FILL_EXTRA);
     T_SENSOR_DB    = prefs.getUInt("sensor_db",  DEFAULT_T_SENSOR_DB);
+    T_V3_FILL      = prefs.getUInt("v3_fill",    DEFAULT_T_V3_FILL);
     prefs.end();
 
     prefs.begin("sched", true);
@@ -935,6 +1038,15 @@ static void prefs_load() {
         snprintf(key, sizeof(key), "dow%d", i); g_sched[i].dow_mask = prefs.getUChar(key, 0);
         snprintf(key, sizeof(key), "h%d",   i); g_sched[i].hour     = prefs.getUChar(key, 8);
         snprintf(key, sizeof(key), "m%d",   i); g_sched[i].minute   = prefs.getUChar(key, 0);
+    }
+    prefs.end();
+
+    prefs.begin("schedv3", true);
+    for (int i = 0; i < SCHED_SLOTS; i++) {
+        snprintf(key, sizeof(key), "en%d",  i); g_sched_v3[i].enabled  = prefs.getBool (key, false);
+        snprintf(key, sizeof(key), "dow%d", i); g_sched_v3[i].dow_mask = prefs.getUChar(key, 0);
+        snprintf(key, sizeof(key), "h%d",   i); g_sched_v3[i].hour     = prefs.getUChar(key, 8);
+        snprintf(key, sizeof(key), "m%d",   i); g_sched_v3[i].minute   = prefs.getUChar(key, 0);
     }
     prefs.end();
 }
@@ -949,6 +1061,7 @@ void setup() {
     // ── 安全最優先: 全リレーを OFF 状態に設定 ─────────────────────────────────
     pinMode(PIN_V1, OUTPUT); digitalWrite(PIN_V1, RELAY_OFF);
     pinMode(PIN_V2, OUTPUT); digitalWrite(PIN_V2, RELAY_OFF);
+    pinMode(PIN_V3, OUTPUT); digitalWrite(PIN_V3, RELAY_OFF);
 
     // ── センサー入力 ───────────────────────────────────────────────────────────
     pinMode(PIN_AH, INPUT_PULLUP);
@@ -995,12 +1108,15 @@ void setup() {
     server.on("/api/start",    HTTP_POST, handle_start);
     server.on("/api/fill",     HTTP_POST, handle_fill);
     server.on("/api/drain",    HTTP_POST, handle_drain);
+    server.on("/api/fill_v3",  HTTP_POST, handle_fill_v3);
     server.on("/api/stop",     HTTP_POST, handle_stop);
     server.on("/api/reboot",   HTTP_POST, handle_reboot);
     server.on("/api/timers",   HTTP_GET,  handle_get_timers);
     server.on("/api/timers",   HTTP_POST, handle_post_timers);
     server.on("/api/sched",    HTTP_GET,  handle_get_sched);
     server.on("/api/sched",    HTTP_POST, handle_post_sched);
+    server.on("/api/sched_v3", HTTP_GET,  handle_get_sched_v3);
+    server.on("/api/sched_v3", HTTP_POST, handle_post_sched_v3);
     server.on("/api/config",   HTTP_GET,  handle_get_config);
     server.on("/api/config",   HTTP_POST, handle_post_config);
     server.on("/api/wifi",     HTTP_POST, handle_post_wifi);
