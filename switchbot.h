@@ -3,12 +3,13 @@
 
 // SwitchBot API v1.1 (HTTPS + HMAC-SHA256)
 // 認証情報は Preferences("switchbot") から読み込む。
-// pumpOn()/pumpOff() はそれぞれ最大3回リトライし、失敗時は false を返す。
+// プラグは V3 給水バルブ（2匹目リクガメ用）の電源に接続する。
+// plugOn()/plugOff() はそれぞれ最大3回リトライし、失敗時は false を返す。
 class SwitchBot {
 public:
     void begin();                    // Preferences から認証情報をロード
-    bool pumpOn();
-    bool pumpOff();
+    bool plugOn();
+    bool plugOff();
 
     // 設定値のゲッター（WebUI マスク表示用）
     String tokenMasked()  const;

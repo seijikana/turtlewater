@@ -2,7 +2,7 @@
 #include <pgmspace.h>
 
 // Web UI — スマホ対応 (max-width 480px)
-// 3秒ポーリング、5ステップ進捗バー、センサー表示、スケジュール/タイマー/SwitchBot/WiFi設定
+// 3秒ポーリング、進捗バー、センサー・出力表示、スケジュール/タイマー/SwitchBot/WiFi設定
 const char HTML_PAGE[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 <html lang="ja"><head>
 <meta charset="UTF-8">
@@ -54,6 +54,13 @@ th{color:#00d4ff}
     <span class="snsr" id="s-bh">B_H ⬜</span>
     <span class="snsr" id="s-bl">B_L ⬜</span>
   </div>
+  <div class="sensors">
+    <span class="snsr" id="o-v1">V1</span>
+    <span class="snsr" id="o-pump_a">ポンプA</span>
+    <span class="snsr" id="o-pump_b">ポンプB</span>
+    <span class="snsr" id="o-v2">V2上排水弁</span>
+    <span class="snsr" id="o-v3">V3</span>
+  </div>
   <div class="btn-row">
     <button class="b-auto" onclick="apiPost('/api/start')">▶ 自動</button>
     <button class="b-fill" onclick="apiPost('/api/fill')">💧 給水</button>
@@ -68,13 +75,16 @@ th{color:#00d4ff}
   <div class="btn-row">
     <button class="b-sm" onclick="manual('v1',1)">V1 ON</button>
     <button class="b-sm" onclick="manual('v1',0)">V1 OFF</button>
-    <button class="b-sm" onclick="manual('v2',1)">V2 ON</button>
-    <button class="b-sm" onclick="manual('v2',0)">V2 OFF</button>
+    <button class="b-sm" onclick="manual('pump_a',1)">ポンプA(上) ON</button>
+    <button class="b-sm" onclick="manual('pump_a',0)">ポンプA(上) OFF</button>
+    <button class="b-sm" onclick="manual('pump_b',1)">ポンプB(下) ON</button>
+    <button class="b-sm" onclick="manual('pump_b',0)">ポンプB(下) OFF</button>
+    <button class="b-sm" onclick="manual('v2',1)">V2上排水弁 開</button>
+    <button class="b-sm" onclick="manual('v2',0)">V2上排水弁 閉</button>
     <button class="b-sm" onclick="manual('v3',1)">V3 ON</button>
     <button class="b-sm" onclick="manual('v3',0)">V3 OFF</button>
-    <button class="b-sm" onclick="manual('pump',1)">Pump ON</button>
-    <button class="b-sm" onclick="manual('pump',0)">Pump OFF</button>
   </div>
+  <div class="msg">※ポンプA ONはV2を開いて全開待ち後に起動、ポンプA停止でV2は自動で閉じます（ポンプBは即時）</div>
 </div>
 
 <div class="card">
@@ -99,8 +109,9 @@ th{color:#00d4ff}
 
 <div class="card">
   <h2>タイムアウト設定（秒）</h2>
-  <label>排水最大時間<input type="number" id="t-drain" min="10" max="3600"></label>
-  <label>移送最大時間<input type="number" id="t-transfer" min="10" max="3600"></label>
+  <label>排水最大時間（上下並行）<input type="number" id="t-drain" min="10" max="3600"></label>
+  <label>V2全開待ち時間（V2開→ポンプA ONまで）<input type="number" id="t-v2travel" min="0" max="60"></label>
+  <label>溢れ排水 追加時間（H OFF後）<input type="number" id="t-ovfextra" min="0" max="120"></label>
   <label>給水最大時間<input type="number" id="t-fill" min="10" max="3600"></label>
   <label>低水位補給 追加給水時間（AL&amp;BL ON後）<input type="number" id="t-extra" min="0" max="300"></label>
   <label>センサーデバウンス時間（秒）<input type="number" id="t-sdb" min="0" max="30"></label>
@@ -110,7 +121,7 @@ th{color:#00d4ff}
 </div>
 
 <div class="card">
-  <h2>SwitchBot 設定</h2>
+  <h2>SwitchBot 設定（V3給水弁プラグ）</h2>
   <label>Token<input type="password" id="sb-tok" placeholder="(未変更)"></label>
   <label>Secret<input type="password" id="sb-sec" placeholder="(未変更)"></label>
   <label>Device ID<input type="text" id="sb-dev"></label>
@@ -173,6 +184,10 @@ async function poll(){
       el.textContent=k.toUpperCase()+(v?' 💧':' ⬜');
       el.className='snsr'+(v?' on':'');
     });
+    const O=d.outputs||{};
+    ['v1','pump_a','pump_b','v2','v3'].forEach(k=>{
+      document.getElementById('o-'+k).className='snsr'+(O[k]?' on':'');
+    });
     const tb=document.getElementById('hist');
     tb.innerHTML=(d.history||[]).map(h=>{
       const dt=new Date(h.ts*1000);
@@ -188,13 +203,15 @@ async function apiPost(url){
   poll();
 }
 async function manual(dev,val){
-  try{await fetch(`/api/m/${dev}/${val}`,{method:'POST'});}catch(e){}
+  try{const r=await fetch(`/api/m/${dev}/${val}`,{method:'POST'});if(!r.ok)alert('Error: '+r.status);}catch(e){}
+  poll();
 }
 
 async function loadTimers(){
   try{const d=await(await fetch('/api/timers')).json();
     document.getElementById('t-drain').value=d.drain_max;
-    document.getElementById('t-transfer').value=d.transfer_max;
+    document.getElementById('t-v2travel').value=d.v2_travel;
+    document.getElementById('t-ovfextra').value=d.ovf_extra;
     document.getElementById('t-fill').value=d.fill_max;
     document.getElementById('t-extra').value=d.fill_extra;
     document.getElementById('t-sdb').value=d.sensor_db;
@@ -204,11 +221,12 @@ async function loadTimers(){
 async function saveTimers(){
   const body=JSON.stringify({
     drain_max:+document.getElementById('t-drain').value,
-    transfer_max:+document.getElementById('t-transfer').value,
     fill_max:+document.getElementById('t-fill').value,
     fill_extra:+document.getElementById('t-extra').value,
     sensor_db:+document.getElementById('t-sdb').value,
-    v3_fill:+document.getElementById('t-v3fill').value
+    v3_fill:+document.getElementById('t-v3fill').value,
+    v2_travel:+document.getElementById('t-v2travel').value,
+    ovf_extra:+document.getElementById('t-ovfextra').value
   });
   const r=await fetch('/api/timers',{method:'POST',headers:{'Content-Type':'application/json'},body});
   document.getElementById('m-timer').textContent=r.ok?'✔ 保存しました':'✘ エラー';

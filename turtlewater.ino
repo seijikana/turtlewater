@@ -79,11 +79,12 @@ char              g_status[16] = "idle"; // "idle" / "running" / "error"
 
 // タイムアウト (秒, Preferences から起動時にロード)
 volatile uint32_t T_DRAIN_MAX;
-volatile uint32_t T_TRANSFER_MAX;
 volatile uint32_t T_FILL_MAX;
 volatile uint32_t T_FILL_EXTRA;   // 低水位補給: AL&BL ON確認後の追加給水時間
 volatile uint32_t T_SENSOR_DB;    // 水位センサーデバウンス時間(秒)
 volatile uint32_t T_V3_FILL;      // V3給水時間(秒): 2匹目リクガメ用、センサーなし時間指定給水
+volatile uint32_t T_V2_TRAVEL;    // V2全開待ち時間(秒): V2を開いてからポンプA ONまで
+volatile uint32_t T_OVF_EXTRA;    // 溢れ排水: H OFF確認後の追加排水時間(秒)
 
 // ─── 実行履歴リングバッファ ──────────────────────────────────────────────────
 struct HistEntry {
@@ -109,7 +110,8 @@ static SchedSlot g_sched_v3[SCHED_SLOTS]; // V3専用スケジュール（V1/V2�
 
 // ─── シーケンスキュー ─────────────────────────────────────────────────────────
 struct SeqReq {
-    uint8_t type;          // 0=auto, 1=fill, 2=drain, 3=fill_low(watchdog), 4=fill_v3
+    uint8_t type;          // 0=auto, 1=fill, 2=drain, 3=fill_low(watchdog), 4=fill_v3, 5=drain_ovf(watchdog)
+    uint8_t tubs;          // type=5 用: bit0=上タライ, bit1=下タライ
     char    trigger[12];
 };
 static QueueHandle_t g_seq_queue;
@@ -183,18 +185,120 @@ inline bool water_detected(int pin) {
     return (digitalRead(pin) == HIGH); // フォールバック（通常到達しない）
 }
 
-void set_v1(bool on) { digitalWrite(PIN_V1, on ? RELAY_ON : RELAY_OFF); }
-void set_v2(bool on) { digitalWrite(PIN_V2, on ? RELAY_ON : RELAY_OFF); }
-void set_v3(bool on) { digitalWrite(PIN_V3, on ? RELAY_ON : RELAY_OFF); }
+static volatile bool g_v1_on = false;
+void set_v1(bool on) { g_v1_on = on; digitalWrite(PIN_V1, on ? RELAY_ON : RELAY_OFF); }
 
-bool pump_on()  { return switchbot.pumpOn();  }
-bool pump_off() { return switchbot.pumpOff(); }
+// ─── 排水ポンプ + V2 上タライ排水弁 ──────────────────────────────────────────
+// ポンプは必ず pumps_request() / pumps_service() を通して制御する。
+//   ・ポンプA 起動要求 → V2 を開き、T_V2_TRAVEL 秒（全開待ち）経過後にポンプA ON
+//   ・ポンプA 停止 → 即 V2 閉（上タライ → 合流部 → ポンプB → 下タライへのサイフォン逆流防止）
+//   ・ポンプB は V2 と無関係に即時 ON/OFF（ベランダへのサイフォンは排水口の高さで対策）
+// 停止は即時反映。ポンプA の起動は pumps_service() が V2 全開待ちを確認してから行うため、
+// シーケンスのループと loop() の両方から定期的に呼ぶ。
+static SemaphoreHandle_t g_out_mtx;
+static volatile bool     g_req_a     = false;  // ポンプA 起動要求
+static volatile bool     g_req_b     = false;  // ポンプB 起動要求
+static volatile bool     g_pump_a    = false;  // ポンプA 実出力
+static volatile bool     g_pump_b    = false;  // ポンプB 実出力
+static volatile bool     g_v2_manual = false;  // 手動 V2 開（WebUI）
+static volatile bool     g_v2_open   = false;  // V2 実出力
+static volatile uint32_t g_v2_opened_at = 0;   // V2 を開いた時刻 (millis)
+
+static void pumps_service() {
+    xSemaphoreTake(g_out_mtx, portMAX_DELAY);
+    if ((g_req_a || g_v2_manual) && !g_v2_open) {
+        g_v2_open      = true;
+        g_v2_opened_at = millis();
+        digitalWrite(PIN_V2, RELAY_ON);
+        Serial.printf("[Pump] V2 open → wait %lus\n", (unsigned long)T_V2_TRAVEL);
+    }
+    bool ready = g_v2_open && (millis() - g_v2_opened_at >= T_V2_TRAVEL * 1000UL);
+    bool a = g_req_a && ready;
+    bool b = g_req_b;
+    if (a != g_pump_a) {
+        g_pump_a = a;
+        digitalWrite(PIN_PUMP_A, a ? RELAY_ON : RELAY_OFF);
+        Serial.printf("[Pump] A %s\n", a ? "ON" : "OFF");
+    }
+    if (b != g_pump_b) {
+        g_pump_b = b;
+        digitalWrite(PIN_PUMP_B, b ? RELAY_ON : RELAY_OFF);
+        Serial.printf("[Pump] B %s\n", b ? "ON" : "OFF");
+    }
+    if (!g_req_a && !g_v2_manual && g_v2_open) { // ポンプA 停止後に閉じる
+        g_v2_open = false;
+        digitalWrite(PIN_V2, RELAY_OFF);
+        Serial.println("[Pump] V2 close");
+    }
+    xSemaphoreGive(g_out_mtx);
+}
+
+static void pumps_request(bool a, bool b) {
+    g_req_a = a;
+    g_req_b = b;
+    pumps_service();
+}
+
+static void set_v2_manual(bool on) {
+    g_v2_manual = on;
+    pumps_service();
+}
+
+static void pumps_off() {
+    g_req_a     = false;
+    g_req_b     = false;
+    g_v2_manual = false;
+    pumps_service();
+}
+
+// ─── V3 給水バルブ (SwitchBot プラグ) ────────────────────────────────────────
+// センサーなしのため閉止失敗は溢れに直結する。
+//   ・ON 送信時点で g_v3_on=true（応答が失敗しても実機は ON の可能性あり）
+//   ・OFF 成功でのみ g_v3_on=false。失敗時は g_v3_off_pending を立て、
+//     v3_retry_service() (loop) が 10 秒ごとに再送する
+static volatile bool g_v3_on          = false;
+static volatile bool g_v3_off_pending = false;
+
+static bool set_v3(bool on) {
+    if (on) {
+        g_v3_on          = true;
+        g_v3_off_pending = false;
+        return switchbot.plugOn();
+    }
+    bool ok = switchbot.plugOff();
+    if (ok) {
+        g_v3_on          = false;
+        g_v3_off_pending = false;
+    } else {
+        g_v3_off_pending = true;
+        Serial.println("[V3] turnOff FAILED → retry pending");
+    }
+    return ok;
+}
+
+static void v3_retry_service() {
+    static uint32_t last = 0;
+    if (!g_v3_off_pending || g_running) return; // 実行中は seq_task の all_off() に任せる
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (time(nullptr) < 1600000000) return;     // NTP 未同期（署名の t が不正になる）
+    if (last != 0 && millis() - last < 10000) return;
+    if (last != 0) Audio::beep_error();         // 2回目以降 = 失敗が続いている
+    last = millis();
+    Serial.println("[V3] send turnOff (pending)");
+    set_v3(false);
+}
 
 void all_off() {
     set_v1(false);
-    set_v2(false);
+    pumps_off();
+    if (g_v3_on || g_v3_off_pending) set_v3(false);
+}
+
+// 緊急停止: V3 は状態に関わらず必ず OFF を送る
+static void emergency_off() {
+    set_v1(false);
+    pumps_off();
     set_v3(false);
-    pump_off();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -267,108 +371,65 @@ static bool check_stop() {
     return false;
 }
 
-// ─── 共通排水ルーティン ───────────────────────────────────────────────────────
-// ポンプON + V2をA_Lに追従（水あり→V2開、空→V2閉）
-// A_L AND B_L が両方空になったら正常終了
-static bool drain_tracking(uint32_t timeout_s) {
-    if (!pump_on()) {
-        Serial.println("[Drain] pump_on FAILED");
-        return false;
-    }
+// ─── 共通排水ルーティン（上下独立） ─────────────────────────────────────────
+// 上タライ=ポンプA、下タライ=ポンプB を並行運転し、各タライの停止センサーが
+// OFF になってから extra_s 秒後にそのポンプだけ停止する（一度止めたら再起動しない）。
+//   sense_a / sense_b: 停止判定センサー（-1 = そのタライは排水しない）
+// 両ポンプ停止で正常終了。V2 は pumps_service() がポンプA に連動して開閉する。
+static bool drain_tubs(int sense_a, int sense_b, uint32_t extra_s, uint32_t timeout_s) {
+    struct Tub {
+        const char* name;
+        int         sense;
+        bool        active;    // ポンプ運転中（要求中）
+        bool        off_seen;  // 停止センサー OFF 検知済み
+        uint32_t    off_at;
+    };
+    Tub tub[2] = {
+        {"A", sense_a, sense_a >= 0 && water_detected(sense_a), false, 0},
+        {"B", sense_b, sense_b >= 0 && water_detected(sense_b), false, 0},
+    };
+    uint32_t deadline = millis() + (timeout_s + T_V2_TRAVEL) * 1000UL;
 
-    bool     prev_al  = water_detected(PIN_AL);
-    bool     prev_bl  = water_detected(PIN_BL);
-    uint32_t deadline = millis() + timeout_s * 1000UL;
+    Serial.printf("[Drain] start  A:%s=%d B:%s=%d  extra=%lus timeout=%lus\n",
+        sense_a >= 0 ? snsr_name(sense_a) : "-", tub[0].active,
+        sense_b >= 0 ? snsr_name(sense_b) : "-", tub[1].active,
+        (unsigned long)extra_s, (unsigned long)timeout_s);
 
-    Serial.printf("[Drain] start  AL=%d BL=%d  timeout=%lus\n",
-                  prev_al, prev_bl, (unsigned long)timeout_s);
-
-    while (true) {
+    while (tub[0].active || tub[1].active) {
         sensors_update();
         if (g_stop_flag) {
             Serial.println("[Drain] STOP_FLAG");
             all_off(); return false;
         }
         if (millis() > deadline) {
-            Serial.printf("[Drain] TIMEOUT  AL=%d BL=%d\n",
-                          water_detected(PIN_AL), water_detected(PIN_BL));
+            Serial.printf("[Drain] TIMEOUT  A=%d B=%d\n", tub[0].active, tub[1].active);
             all_off(); return false;
         }
 
-        bool al = water_detected(PIN_AL);
-        bool bl = water_detected(PIN_BL);
-
-        // センサー変化時のみログ
-        if (al != prev_al || bl != prev_bl) {
-            Serial.printf("[Drain] AL=%d BL=%d\n", al, bl);
-            prev_al = al;
-            prev_bl = bl;
+        uint32_t now = millis();
+        for (Tub& t : tub) {
+            if (!t.active) continue;
+            if (!t.off_seen && !water_detected(t.sense)) {
+                t.off_seen = true;
+                t.off_at   = now;
+                Serial.printf("[Drain] %s: %s OFF → stop in %lus\n",
+                    t.name, snsr_name(t.sense), (unsigned long)extra_s);
+            }
+            if (t.off_seen && now - t.off_at >= extra_s * 1000UL) {
+                t.active = false;
+                Serial.printf("[Drain] %s: done\n", t.name);
+            }
         }
-
-        set_v2(al); // V2 を A_L センサーに追従
-
-        if (!al && !bl) break; // 両タライ空 → 完了
+        pumps_request(tub[0].active, tub[1].active);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    set_v2(false);
-    pump_off();
-    Serial.println("[Drain] done  AL&BL both OFF");
+    pumps_request(false, false);
+    Serial.println("[Drain] done");
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  シーケンス本体
-// ═══════════════════════════════════════════════════════════════════════════════
-
-bool run_auto() {
-    const int TOTAL = 4;
-
-    // Step 1: ポンプON + V2をA_Lに追従しながら両タライ排水
-    set_progress(1, TOTAL);
-    Serial.println("[Auto] Step 1/4 drain");
-    if (!drain_tracking(T_DRAIN_MAX + T_TRANSFER_MAX)) return false;
-    if (check_stop()) return false;
-
-    // Step 2: ポンプON + V2追従で残留水を再排水 (AL&BL 両方OFF)
-    set_progress(2, TOTAL);
-    Serial.println("[Auto] Step 2/4 drain (residual)");
-    if (!drain_tracking(T_TRANSFER_MAX)) return false;
-    if (check_stop()) return false;
-
-    // Step 3: V1 ON → AH or BH ON で停止
-    set_progress(3, TOTAL);
-    Serial.println("[Auto] Step 3/4 fill");
-    if (!fill_core()) { all_off(); return false; }
-    if (check_stop()) return false;
-
-    // Step 4: ポンプON + V2追従で仕上げ排水
-    set_progress(4, TOTAL);
-    Serial.println("[Auto] Step 4/4 drain (final)");
-    if (!drain_tracking(T_DRAIN_MAX + T_TRANSFER_MAX)) return false;
-
-    set_progress(0, TOTAL);
-    return true;
-}
-
-bool run_fill() {
-    g_step = 1; g_progress = 10;
-    Serial.println("[Fill] manual start");
-    bool ok = fill_core();
-    g_progress = 100;
-    return ok;
-}
-
-bool run_drain() {
-    // AL & BL 両方OFF になるまでポンプ継続
-    g_step = 1; g_progress = 10;
-    Serial.println("[Drain] manual start");
-    bool ok = drain_tracking(T_DRAIN_MAX + T_TRANSFER_MAX);
-    g_progress = 100;
-    return ok;
-}
-
-// ─── 共通給水ルーティン (run_auto Step3 / run_fill 手動) ─────────────────────
-// AH or BH ON になるまで給水して停止
+// ─── 共通給水ルーティン (run_auto Step2 / run_fill 手動) ─────────────────────
+// AH or BH ON になるまで給水して停止（満水）
 static bool fill_core() {
     set_v1(true);
     uint32_t deadline = millis() + T_FILL_MAX * 1000UL;
@@ -391,12 +452,11 @@ static bool fill_core() {
     return true;
 }
 
-// watchdog 低水位補給: run_auto/run_fill とは別ロジック
+// 低水位補給 (watchdog / run_auto Step4): fill_core とは別ロジック
 //   Phase 1: V1 ON → AL & BL 両方 ON になるまで給水
 //   Phase 2: そのまま T_FILL_EXTRA 秒追加給水
 //   安全停止: AH or BH 検知で即停止
-bool run_fill_low() {
-    g_step = 1; g_progress = 10;
+static bool fill_low_core() {
     set_v1(true);
     uint32_t deadline       = millis() + T_FILL_MAX * 1000UL;
     bool     target_reached = false;
@@ -417,7 +477,6 @@ bool run_fill_low() {
             target_since   = millis();
             Serial.printf("[FillLow] AL&BL ON → extra fill %lus\n", (unsigned long)T_FILL_EXTRA);
         }
-
         if (target_reached && millis() - target_since >= T_FILL_EXTRA * 1000UL) break;
 
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -426,25 +485,96 @@ bool run_fill_low() {
     Serial.printf("[FillLow] done  AH=%d BH=%d AL=%d BL=%d\n",
         water_detected(PIN_AH), water_detected(PIN_BH),
         water_detected(PIN_AL), water_detected(PIN_BL));
-    g_progress = 100;
     return true;
 }
 
-// V3給水: センサーなし、設定時間のみで給水（2匹目リクガメ用）
+// ═══════════════════════════════════════════════════════════════════════════════
+//  シーケンス本体
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool run_auto() {
+    const int TOTAL = 4;
+
+    // Step 1: 上下並行排水（各 L OFF で個別停止）
+    set_progress(1, TOTAL);
+    Serial.println("[Auto] Step 1/4 drain");
+    if (!drain_tubs(PIN_AL, PIN_BL, 0, T_DRAIN_MAX)) return false;
+    if (check_stop()) return false;
+
+    // Step 2: V1 ON → AH or BH ON で停止（満水）
+    set_progress(2, TOTAL);
+    Serial.println("[Auto] Step 2/4 fill (full)");
+    if (!fill_core()) { all_off(); return false; }
+    if (check_stop()) return false;
+
+    // Step 3: 上下並行で仕上げ排水
+    set_progress(3, TOTAL);
+    Serial.println("[Auto] Step 3/4 drain (final)");
+    if (!drain_tubs(PIN_AL, PIN_BL, 0, T_DRAIN_MAX)) return false;
+    if (check_stop()) return false;
+
+    // Step 4: watchdog と同じ低水位補給で通常水位まで給水
+    set_progress(4, TOTAL);
+    Serial.println("[Auto] Step 4/4 fill (normal level)");
+    if (!fill_low_core()) { all_off(); return false; }
+
+    set_progress(0, TOTAL);
+    return true;
+}
+
+bool run_fill() {
+    g_step = 1; g_progress = 10;
+    Serial.println("[Fill] manual start");
+    bool ok = fill_core();
+    g_progress = 100;
+    return ok;
+}
+
+bool run_drain() {
+    // AL・BL がそれぞれ OFF になるまで上下ポンプを並行運転
+    g_step = 1; g_progress = 10;
+    Serial.println("[Drain] manual start");
+    bool ok = drain_tubs(PIN_AL, PIN_BL, 0, T_DRAIN_MAX);
+    g_progress = 100;
+    return ok;
+}
+
+// watchdog 溢れ排水: 溢れたタライのみ、H OFF から T_OVF_EXTRA 秒後まで排水
+bool run_drain_ovf(uint8_t tubs) {
+    g_step = 1; g_progress = 10;
+    Serial.printf("[DrainOvf] start  A=%d B=%d\n", (tubs & 1) != 0, (tubs & 2) != 0);
+    bool ok = drain_tubs((tubs & 1) ? PIN_AH : -1,
+                         (tubs & 2) ? PIN_BH : -1,
+                         T_OVF_EXTRA, T_DRAIN_MAX);
+    g_progress = 100;
+    return ok;
+}
+
+bool run_fill_low() {
+    g_step = 1; g_progress = 10;
+    bool ok = fill_low_core();
+    g_progress = 100;
+    return ok;
+}
+
+// V3給水: センサーなし、設定時間のみで給水（2匹目リクガメ用、SwitchBot プラグ）
 bool run_fill_v3() {
     g_step = 1; g_progress = 10;
     Serial.printf("[FillV3] start  duration=%lus\n", (unsigned long)T_V3_FILL);
-    set_v3(true);
+    if (!set_v3(true)) {
+        Serial.println("[FillV3] turnOn FAILED"); // OFF は seq_task の all_off() が送る
+        return false;
+    }
     uint32_t deadline = millis() + T_V3_FILL * 1000UL;
     while (true) {
         if (g_stop_flag)          { set_v3(false); return false; }
         if (millis() >= deadline) break;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    set_v3(false);
+    bool ok = set_v3(false);
     g_progress = 100;
-    Serial.println("[FillV3] done");
-    return true;
+    Serial.println(ok ? "[FillV3] done" : "[FillV3] turnOff FAILED");
+    return ok;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -473,6 +603,7 @@ void seq_task(void* pv) {
             case 2: ok = run_drain();     break;
             case 3: ok = run_fill_low();  break; // watchdog低水位補給
             case 4: ok = run_fill_v3();   break;
+            case 5: ok = run_drain_ovf(req.tubs); break; // watchdog溢れ排水
             default:ok = false;           break;
         }
         all_off(); // 安全フォールバック
@@ -501,24 +632,28 @@ void watchdog_sched_task(void* pv) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         sensors_update();
 
-        // ── watchdog: 水位監視 ────────────────────────────────────────────────
-        // fill_low 完了後、V1閉止で水面がセンサー付近まで下がる場合があるため
-        // クールダウン期間中は低水位トリガーをスキップする
+        // ── watchdog: 水位監視（上下独立判定） ──────────────────────────────────
+        // シーケンス完了後、V1閉止で水面がセンサー付近まで下がる場合があるため
+        // 完了後2分間のクールダウン中は低水位トリガーをスキップする
         static uint32_t fill_low_cd = 0; // クールダウン終了時刻 (millis)
 
-        if (!g_running && uxQueueMessagesWaiting(g_seq_queue) == 0) {
-            if (water_detected(PIN_AH) || water_detected(PIN_BH)) {
-                // 溢れ優先 → 排水 (クールダウン解除)
+        if (g_running || uxQueueMessagesWaiting(g_seq_queue) > 0) {
+            fill_low_cd = millis() + 120000UL; // 完了時点から2分を数える
+        } else {
+            bool ah = water_detected(PIN_AH);
+            bool bh = water_detected(PIN_BH);
+            if (ah || bh) {
+                // 溢れ優先 → 溢れたタライのみ排水 (クールダウン解除)
                 fill_low_cd = 0;
-                Serial.println("[WD] Overflow detected → drain");
+                Serial.printf("[WD] Overflow detected (A=%d B=%d) → drain_ovf\n", ah, bh);
                 Audio::beep_watchdog();
-                SeqReq req; req.type = 2;
+                SeqReq req; req.type = 5;
+                req.tubs = (ah ? 1 : 0) | (bh ? 2 : 0);
                 strncpy(req.trigger, "watchdog", 11);
                 xQueueSend(g_seq_queue, &req, 0);
-            } else if (!water_detected(PIN_AL) && !water_detected(PIN_BL)) {
+            } else if (!water_detected(PIN_AL) || !water_detected(PIN_BL)) {
                 if (millis() >= fill_low_cd) {
-                    // 低水位 → 補給水 (A_L AND B_L 両方空)
-                    fill_low_cd = millis() + 120000UL; // 完了後2分間はスキップ
+                    // 低水位 → 補給水 (A_L OR B_L どちらかが空)
                     Serial.println("[WD] Low water detected → fill_low");
                     Audio::beep_watchdog();
                     SeqReq req; req.type = 3;
@@ -607,6 +742,12 @@ void handle_status() {
     j += "\"al\":"; j += water_detected(PIN_AL)?"true":"false"; j += ",";
     j += "\"bh\":"; j += water_detected(PIN_BH)?"true":"false"; j += ",";
     j += "\"bl\":"; j += water_detected(PIN_BL)?"true":"false"; j += "},";
+    j += "\"outputs\":{";
+    j += "\"v1\":";     j += g_v1_on   ?"true":"false"; j += ",";
+    j += "\"v2\":";     j += g_v2_open ?"true":"false"; j += ",";
+    j += "\"pump_a\":"; j += g_pump_a  ?"true":"false"; j += ",";
+    j += "\"pump_b\":"; j += g_pump_b  ?"true":"false"; j += ",";
+    j += "\"v3\":";     j += g_v3_on   ?"true":"false"; j += "},";
     j += "\"history\":[";
     xSemaphoreTake(g_hist_mtx, portMAX_DELAY);
     for (int i = 0; i < g_hist_count; i++) {
@@ -630,10 +771,7 @@ void handle_fill_v3(){ enqueue_from_web(4, "web_v3"); }
 void handle_stop() {
     Serial.println("[STOP] Web UI");
     g_stop_flag = true;
-    set_v1(false);
-    set_v2(false);
-    set_v3(false);
-    pump_off();
+    emergency_off();
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -648,11 +786,12 @@ void handle_reboot() {
 
 void handle_get_timers() {
     String j = "{\"drain_max\":"    + String(T_DRAIN_MAX)
-             + ",\"transfer_max\":" + String(T_TRANSFER_MAX)
              + ",\"fill_max\":"     + String(T_FILL_MAX)
              + ",\"fill_extra\":"   + String(T_FILL_EXTRA)
              + ",\"sensor_db\":"    + String(T_SENSOR_DB)
-             + ",\"v3_fill\":"      + String(T_V3_FILL) + "}";
+             + ",\"v3_fill\":"      + String(T_V3_FILL)
+             + ",\"v2_travel\":"    + String(T_V2_TRAVEL)
+             + ",\"ovf_extra\":"    + String(T_OVF_EXTRA) + "}";
     server.send(200, "application/json", j);
 }
 
@@ -663,18 +802,20 @@ void handle_post_timers() {
         int p = body.indexOf(k);
         return (p >= 0) ? body.substring(p + k.length()).toInt() : -1;
     };
-    int d   = getInt("drain_max"), tr = getInt("transfer_max");
+    int d   = getInt("drain_max");
     int f   = getInt("fill_max"),  fe = getInt("fill_extra");
     int sdb = getInt("sensor_db");
     int v3f = getInt("v3_fill");
+    int v2t = getInt("v2_travel"), oe = getInt("ovf_extra");
     Preferences prefs;
     prefs.begin("timers", false);
     if (d   > 0)  { T_DRAIN_MAX    = d;   prefs.putUInt("drain",      d);   }
-    if (tr  > 0)  { T_TRANSFER_MAX = tr;  prefs.putUInt("transfer",   tr);  }
     if (f   > 0)  { T_FILL_MAX     = f;   prefs.putUInt("fill",       f);   }
     if (fe  > 0)  { T_FILL_EXTRA   = fe;  prefs.putUInt("fill_extra", fe);  }
     if (sdb >= 0) { T_SENSOR_DB    = sdb; prefs.putUInt("sensor_db",  sdb); }
     if (v3f > 0)  { T_V3_FILL      = v3f; prefs.putUInt("v3_fill",    v3f); }
+    if (v2t >= 0) { T_V2_TRAVEL    = v2t; prefs.putUInt("v2_travel",  v2t); }
+    if (oe  >= 0) { T_OVF_EXTRA    = oe;  prefs.putUInt("ovf_extra",  oe);  }
     prefs.end();
     server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -868,13 +1009,16 @@ static void handle_manual(const String& path) {
         set_v1(on);
         server.send(200, "application/json", "{\"ok\":true}");
     } else if (dev == "v2") {
-        set_v2(on);
+        set_v2_manual(on); // ポンプA 稼働中は OFF にしても開のまま
+        server.send(200, "application/json", "{\"ok\":true}");
+    } else if (dev == "pump_a") {
+        pumps_request(on, g_req_b); // ON は V2 全開待ち後に反映（ポンプB は即時）
+        server.send(200, "application/json", "{\"ok\":true}");
+    } else if (dev == "pump_b") {
+        pumps_request(g_req_a, on);
         server.send(200, "application/json", "{\"ok\":true}");
     } else if (dev == "v3") {
-        set_v3(on);
-        server.send(200, "application/json", "{\"ok\":true}");
-    } else if (dev == "pump") {
-        bool ok = on ? pump_on() : pump_off();
+        bool ok = set_v3(on);
         server.send(ok ? 200 : 500, "application/json",
                     ok ? "{\"ok\":true}" : "{\"error\":\"switchbot failed\"}");
     } else {
@@ -912,12 +1056,22 @@ void IRAM_ATTR isr_btn5() {                 // V3給水開始: ISR はフラグ�
     }
 }
 
+// ボタン押下の確定: BTN_CONFIRM_MS の間 BTN_SAMPLE_MS ごとにピンを読み、
+// 全サンプル LOW なら本物の押下。1回でも HIGH ならノイズとして即 false。
+// （ポンプ運転中の EMI ノイズは短いパルスのため、連続 LOW にはならない）
+static bool btn_confirm(int pin) {
+    for (uint32_t t = 0; t <= BTN_CONFIRM_MS; t += BTN_SAMPLE_MS) {
+        if (digitalRead(pin) != LOW) return false;
+        vTaskDelay(pdMS_TO_TICKS(BTN_SAMPLE_MS));
+    }
+    return true;
+}
+
 // loop() から呼ぶボタン処理
 static void process_buttons() {
-    if (g_btn_flag[0]) {                    // ①自動水替え: ピン再読でノイズか本物か判定
+    if (g_btn_flag[0]) {                    // ①自動水替え: 複数回サンプリングで判定
         g_btn_flag[0] = false;
-        vTaskDelay(pdMS_TO_TICKS(20));
-        if (digitalRead(PIN_BTN1) == LOW) {
+        if (btn_confirm(PIN_BTN1)) {
             if (!g_running && uxQueueMessagesWaiting(g_seq_queue) == 0) {
                 Serial.println("[BTN] BTN1 auto");
                 SeqReq req; req.type = 0; strncpy(req.trigger, "auto", 11);
@@ -925,10 +1079,9 @@ static void process_buttons() {
             }
         } else { Serial.println("[BTN] BTN1 noise (ignored)"); }
     }
-    if (g_btn_flag[1]) {                    // ②強制給水: ピン再読でノイズか本物か判定
+    if (g_btn_flag[1]) {                    // ②強制給水: 複数回サンプリングで判定
         g_btn_flag[1] = false;
-        vTaskDelay(pdMS_TO_TICKS(20));
-        if (digitalRead(PIN_BTN2) == LOW) {
+        if (btn_confirm(PIN_BTN2)) {
             if (!g_running && uxQueueMessagesWaiting(g_seq_queue) == 0) {
                 Serial.println("[BTN] BTN2 fill");
                 SeqReq req; req.type = 1; strncpy(req.trigger, "fill", 11);
@@ -936,10 +1089,9 @@ static void process_buttons() {
             }
         } else { Serial.println("[BTN] BTN2 noise (ignored)"); }
     }
-    if (g_btn_flag[2]) {                    // ③強制排水: ピン再読でノイズか本物か判定
+    if (g_btn_flag[2]) {                    // ③強制排水: 複数回サンプリングで判定
         g_btn_flag[2] = false;
-        vTaskDelay(pdMS_TO_TICKS(20));
-        if (digitalRead(PIN_BTN3) == LOW) {
+        if (btn_confirm(PIN_BTN3)) {
             if (!g_running && uxQueueMessagesWaiting(g_seq_queue) == 0) {
                 Serial.println("[BTN] BTN3 drain");
                 SeqReq req; req.type = 2; strncpy(req.trigger, "drain", 11);
@@ -947,21 +1099,19 @@ static void process_buttons() {
             }
         } else { Serial.println("[BTN] BTN3 noise (ignored)"); }
     }
-    if (g_btn_flag[3]) {                    // ④緊急停止: ピン再読でノイズか本物か判定
+    if (g_btn_flag[3]) {                    // ④緊急停止: 複数回サンプリングで判定
         g_btn_flag[3] = false;
-        vTaskDelay(pdMS_TO_TICKS(20));      // ノイズが収まるまで待つ
-        if (digitalRead(PIN_BTN4) == LOW) { // まだ LOW = 本物の押下
+        if (btn_confirm(PIN_BTN4)) {        // LOW 継続 = 本物の押下
             Serial.println("[STOP] BTN4");
             g_stop_flag = true;
-            set_v1(false); set_v2(false); set_v3(false); pump_off();
+            emergency_off();
         } else {
             Serial.println("[STOP] BTN4 noise (ignored)");
         }
     }
-    if (g_btn_flag[4]) {                    // ⑤V3給水開始: ピン再読でノイズか本物か判定
+    if (g_btn_flag[4]) {                    // ⑤V3給水開始: 複数回サンプリングで判定
         g_btn_flag[4] = false;
-        vTaskDelay(pdMS_TO_TICKS(20));
-        if (digitalRead(PIN_BTN5) == LOW) {
+        if (btn_confirm(PIN_BTN5)) {
             if (!g_running && uxQueueMessagesWaiting(g_seq_queue) == 0) {
                 Serial.println("[BTN] BTN5 fill_v3");
                 SeqReq req; req.type = 4; strncpy(req.trigger, "fill_v3", 11);
@@ -1024,11 +1174,12 @@ static void prefs_load() {
 
     prefs.begin("timers", true);
     T_DRAIN_MAX    = prefs.getUInt("drain",      DEFAULT_T_DRAIN_MAX);
-    T_TRANSFER_MAX = prefs.getUInt("transfer",   DEFAULT_T_TRANSFER_MAX);
     T_FILL_MAX     = prefs.getUInt("fill",       DEFAULT_T_FILL_MAX);
     T_FILL_EXTRA   = prefs.getUInt("fill_extra", DEFAULT_T_FILL_EXTRA);
     T_SENSOR_DB    = prefs.getUInt("sensor_db",  DEFAULT_T_SENSOR_DB);
     T_V3_FILL      = prefs.getUInt("v3_fill",    DEFAULT_T_V3_FILL);
+    T_V2_TRAVEL    = prefs.getUInt("v2_travel",  DEFAULT_T_V2_TRAVEL);
+    T_OVF_EXTRA    = prefs.getUInt("ovf_extra",  DEFAULT_T_OVF_EXTRA);
     prefs.end();
 
     prefs.begin("sched", true);
@@ -1061,7 +1212,12 @@ void setup() {
     // ── 安全最優先: 全リレーを OFF 状態に設定 ─────────────────────────────────
     pinMode(PIN_V1, OUTPUT); digitalWrite(PIN_V1, RELAY_OFF);
     pinMode(PIN_V2, OUTPUT); digitalWrite(PIN_V2, RELAY_OFF);
-    pinMode(PIN_V3, OUTPUT); digitalWrite(PIN_V3, RELAY_OFF);
+    pinMode(PIN_PUMP_A, OUTPUT); digitalWrite(PIN_PUMP_A, RELAY_OFF);
+    pinMode(PIN_PUMP_B, OUTPUT); digitalWrite(PIN_PUMP_B, RELAY_OFF);
+    g_out_mtx = xSemaphoreCreateMutex(); // pumps_service() 用（タスク起動前に生成）
+    // V3 は SwitchBot プラグ: V3給水中の再起動に備え、Wi-Fi/NTP 確立後に
+    // v3_retry_service() が OFF を送る（状態不明 = ON の可能性ありとして扱う）
+    g_v3_on = true; g_v3_off_pending = true;
 
     // ── センサー入力 ───────────────────────────────────────────────────────────
     pinMode(PIN_AH, INPUT_PULLUP);
@@ -1134,6 +1290,8 @@ void loop() {
     sensors_update();
     server.handleClient();
     process_buttons();
+    pumps_service();      // 手動ポンプA ON の V2 全開待ち反映
+    v3_retry_service();   // V3 OFF 失敗時の再送
     wifi_reconnect_check();
     delay(2);
 }

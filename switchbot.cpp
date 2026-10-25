@@ -95,5 +95,5 @@ bool SwitchBot::sendCommand(const char* cmd) {
     return false;
 }
 
-bool SwitchBot::pumpOn()  { return sendCommand("turnOn");  }
-bool SwitchBot::pumpOff() { return sendCommand("turnOff"); }
+bool SwitchBot::plugOn()  { return sendCommand("turnOn");  }
+bool SwitchBot::plugOff() { return sendCommand("turnOff"); }
